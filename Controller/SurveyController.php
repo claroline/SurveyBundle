@@ -50,6 +50,7 @@ class SurveyController extends Controller
     private $security;
     private $surveyManager;
     private $templating;
+    private $translator;
 
     /**
      * @DI\InjectParams({
@@ -60,7 +61,8 @@ class SurveyController extends Controller
      *     "router"          = @DI\Inject("router"),
      *     "security"        = @DI\Inject("security.context"),
      *     "surveyManager"   = @DI\Inject("claroline.manager.survey_manager"),
-     *     "templating"      = @DI\Inject("templating")
+     *     "templating"      = @DI\Inject("templating"),
+     *     "translator"      = @DI\Inject("translator")
      * })
      */
     public function __construct(
@@ -71,7 +73,8 @@ class SurveyController extends Controller
         UrlGeneratorInterface $router,
         SecurityContextInterface $security,
         SurveyManager $surveyManager,
-        TwigEngine $templating
+        TwigEngine $templating,
+        TranslatorInterface $translator
     )
     {
         $this->eventDispatcher = $eventDispatcher;
@@ -82,6 +85,7 @@ class SurveyController extends Controller
         $this->security = $security;
         $this->surveyManager = $surveyManager;
         $this->templating = $templating;
+        $this->translator = $translator;
     }
 
     /**
@@ -1051,7 +1055,7 @@ class SurveyController extends Controller
 
         if (!is_null($surveyAnswer)) {
             $questionsAnswers = $surveyAnswer->getQuestionsAnswers();
-            
+
             foreach ($questionsAnswers as $questionAnswer) {
                 $question = $questionAnswer->getQuestion();
                 $questionId = $question->getId();
@@ -1086,7 +1090,7 @@ class SurveyController extends Controller
                     foreach ($choiceAnswers as $choiceAnswer) {
                         $choiceId = $choiceAnswer->getChoice()->getId();
                         $answersDatas[$questionId][$choiceId] = $choiceId;
-                        
+
                         if ($choiceAnswer->getChoice()->isOther()) {
                             $answersDatas[$questionId]['other'] =
                                 $choiceAnswer->getContent();
@@ -1603,11 +1607,113 @@ class SurveyController extends Controller
         }
     }
 
+    /**
+     * @EXT\Route(
+     *     "/survey/{survey}/results/export",
+     *     name="claro_survey_results_export"
+     * )
+     * @EXT\ParamConverter("user", options={"authenticatedUser" = true})
+     *
+     * @return \Symfony\Component\HttpFoundation\Response
+     */
+    public function resultsExcelExportAction(Survey $survey)
+    {
+        $canEdit = $this->hasSurveyRight($survey, 'EDIT');
+
+        if (!$canEdit && !$survey->getHasPublicResult()) {
+
+            throw new AccessDeniedException();
+        }
+        $questionRelations = $this->surveyManager
+            ->getQuestionRelationsBySurvey($survey);
+        $questions = array();
+        $results = array();
+        $comments = array();
+
+        foreach ($questionRelations as $relation) {
+            $relationQuestion = $relation->getQuestion();
+
+            if ($relationQuestion->getType() !== 'title') {
+                $questions[] = $relation->getQuestion();
+            }
+        }
+
+        foreach ($questions as $question) {
+            $results[$question->getId()] =
+                $this->showTypedQuestionResults($survey, $question, 1, 20, true)->getContent();
+            $comments[$question->getId()] = $this->surveyManager->getCommentsFromQuestionBySurveyAndQuestion(
+                $survey,
+                $question
+            );
+        }
+        $response = new Response(
+            $this->templating->render(
+                "ClarolineSurveyBundle:Survey:surveyResultsExport.html.twig",
+                array(
+                    'survey' => $survey,
+                    'questions' => $questions,
+                    'results' => $results,
+                    'comments' => $comments
+                )
+            )
+        );
+        $fileName = $this->translator->trans('results', array(), 'platform');
+        $response->headers->set('Content-Transfer-Encoding', 'octet-stream');
+        $response->headers->set('Content-Type', 'application/force-download; charset=utf-8');
+        $response->headers->set('Content-Disposition', 'attachment; filename=' . $fileName . '.xls');
+        $response->headers->set('Content-Type', 'application/vnd.ms-excel; charset=utf-8');
+
+        return $response;
+    }
+
+    /**
+     * @EXT\Route(
+     *     "/survey/{survey}/question/{question}/results/export",
+     *     name="claro_survey_question_results_export"
+     * )
+     * @EXT\ParamConverter("user", options={"authenticatedUser" = true})
+     *
+     * @return \Symfony\Component\HttpFoundation\Response
+     */
+    public function questionResultsExcelExportAction(Survey $survey, Question $question)
+    {
+        $canEdit = $this->hasSurveyRight($survey, 'EDIT');
+
+        if (!$canEdit && !$survey->getHasPublicResult()) {
+
+            throw new AccessDeniedException();
+        }
+        $results = array();
+        $comments = array();
+        $results[$question->getId()] =
+            $this->showTypedQuestionResults($survey, $question, 1, 20, true)->getContent();
+
+        $response = new Response(
+            $this->templating->render(
+                "ClarolineSurveyBundle:Survey:surveyResultsExport.html.twig",
+                array(
+                    'survey' => $survey,
+                    'questions' => array($question),
+                    'results' => $results,
+                    'comments' => $comments
+                )
+            )
+        );
+        $fileName = $this->translator->trans('results', array(), 'platform');
+        $response->headers->set('Content-Transfer-Encoding', 'octet-stream');
+        $response->headers->set('Content-Type', 'application/force-download');
+        $response->headers->set('Content-Disposition', 'attachment; filename=' . $fileName . '.xls');
+        $response->headers->set('Content-Type', 'application/vnd.ms-excel; charset=utf-8');
+
+        return $response;
+    }
+
     private function showTypedQuestionResults(
         Survey $survey,
         Question $question,
         $page = 1,
-        $max = 20
+        $max = 20,
+        $forExport = false
     )
     {
         $questionType = $question->getType();
@@ -1619,7 +1725,9 @@ class SurveyController extends Controller
 
                 return $this->showMultipleChoiceQuestionResults(
                     $survey,
-                    $question
+                    $question,
+                    $max,
+                    $forExport
                 );
             case 'open_ended':
 
@@ -1627,7 +1735,8 @@ class SurveyController extends Controller
                     $survey,
                     $question,
                     $page,
-                    $max
+                    $max,
+                    $forExport
                 );
             default:
                 break;
@@ -1639,7 +1748,8 @@ class SurveyController extends Controller
     private function showMultipleChoiceQuestionResults(
         Survey $survey,
         Question $question,
-        $otherMax = 20
+        $otherMax = 20,
+        $forExport = false
     )
     {
         $choices = $this->surveyManager->getChoicesByQuestion($question);
@@ -1690,7 +1800,8 @@ class SurveyController extends Controller
                     'nbRespondents' => $nbRespondents,
                     'choicesRatio' => $choicesRatio,
                     'otherChoice' => $otherChoice,
-                    'otherMax' => $otherMax
+                    'otherMax' => $otherMax,
+                    'forExport' => $forExport
                 )
             )
         );
@@ -1700,15 +1811,21 @@ class SurveyController extends Controller
         Survey $survey,
         Question $question,
         $page = 1,
-        $max = 20
+        $max = 20,
+        $forExport = false
     )
     {
-        $answers = $this->surveyManager->getOpenEndedAnswersBySurveyAndQuestion(
-            $survey,
-            $question,
-            $page,
-            $max
-        );
+        $answers = $forExport ?
+            $this->surveyManager->getOpenEndedAnswersBySurveyAndQuestionWithoutPager(
+                $survey,
+                $question
+            ) :
+            $this->surveyManager->getOpenEndedAnswersBySurveyAndQuestion(
+                $survey,
+                $question,
+                $page,
+                $max
+            );
 
         return new Response(
             $this->templating->render(
@@ -1717,7 +1834,8 @@ class SurveyController extends Controller
                     'survey' => $survey,
                     'question' => $question,
                     'answers' => $answers,
-                    'max' => $max
+                    'max' => $max,
+                    'forExport' => $forExport
                 )
             )
         );
@@ -1959,7 +2077,7 @@ class SurveyController extends Controller
         $collection = new ResourceCollection(array($survey->getResourceNode()));
 
         if (!$this->security->isGranted($right, $collection)) {
-            
+
             throw new AccessDeniedException($collection->getErrorsForDisplay());
         }
     }
